@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "apache-airflow>=3.0.1",
+    "apache-airflow-providers-mongo>=5.1.0",
+    "apache-airflow-providers-standard>=1.2.0",
     "torch>=2.7.1",
     "transformers>=4.52.4",
 ]

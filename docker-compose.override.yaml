@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  db_nosql:
+    container_name: airflow_test
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - airflow-test-data:/data/db
+      - airflow-test-configdb:/data/configdb
+
+volumes:
+  airflow-test-data:
+  airflow-test-configdb:

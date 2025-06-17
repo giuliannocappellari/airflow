@@ -134,13 +134,13 @@ Use the `astro dev run` shortcut to execute Airflow CLI commands inside your run
 * **Test a single task:**
 
   ```bash
-  astro dev run airflow tasks test <dag_id> <task_id> <YYYY-MM-DD>
+  astro dev run tasks test <dag_id> <task_id> <YYYY-MM-DD>
   ```
 
   *Example:*
 
   ```bash
-  astro dev run airflow tasks test txt_to_json count_and_write 2025-06-07
+  astro dev run tasks test character_ingestion_pipeline wait_for_file 2025-06-08
   ```
 
 * **View logs in real-time:**
