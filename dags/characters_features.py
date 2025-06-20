@@ -1,3 +1,5 @@
+import json
+import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -9,6 +11,7 @@ from airflow.providers.standard.operators.python import (
 )
 from airflow.providers.standard.sensors.filesystem import FileSensor
 from airflow.utils.trigger_rule import TriggerRule
+from loguru import logger
 from transformers.pipelines import pipeline
 
 default_args = {
@@ -18,85 +21,135 @@ default_args = {
     "retry_delay": timedelta(minutes=5),
 }
 
+ner = None
+summarizer = None
 
-def extract_characters(file_path: str, **kwargs):
+
+def extract_characters(input_path: str, output_path: str, **kwargs):
     """
     Read the dropped .txt file, extract each unique character and its raw features.
-    Pushes a dict {char: features} to XCom.
+    Pushes a list of dicts to XCom under the key "Entity".
     """
-    chars = {}
-    with open(file_path, "r", encoding="utf-8") as f:
+    global ner, summarizer
+
+    with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
-    for c in set(text):
-        chars[c] = {
-            "unicode": ord(c),
-            "is_alpha": c.isalpha(),
-            "count": text.count(c),
-        }
-    kwargs["ti"].xcom_push(key="chars", value=chars)
+
+    # Lazy-load the NER and summarizer only once per worker
+    if ner is None or summarizer is None:
+        ner = pipeline(
+            "ner",
+            grouped_entities=True,
+            model="dslim/bert-base-NER",
+        )
+        summarizer = pipeline(
+            "summarization",
+            model="sshleifer/distilbart-cnn-12-6",
+        )
+
+    raw_entities = ner(text)
+    entities = {e["word"] for e in raw_entities}
+    results = []
+    for ent in entities:
+        sentences = [s for s in text.split(".") if ent in s]
+        context = ". ".join(sentences) or text
+        summary = summarizer(
+            context,
+            max_length=50,
+            min_length=5,
+            do_sample=False,
+        )[0]["summary_text"]
+        results.append({"Entity": ent, "summary": summary})
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as out:
+        json.dump(results, out)
+
+    # Push to XCom using the TaskInstance in kwargs
+    kwargs["ti"].xcom_push(key="Entity", value=results)
 
 
 def decide_existence(**context):
     """
-    Checks MongoDB for each character.
-    Returns one of two downstream task IDs depending on whether **all** chars are new.
+    Check MongoDB for each character.
+    Returns 'resolve_conflicts' if any already exist, else 'create_characters'.
     """
-    chars = context["ti"].xcom_pull(key="chars", task_ids="extract_characters")
-    hook = MongoHook(conn_id="mongo_default")
+    chars = context["ti"].xcom_pull(
+        key="Entity", task_ids="extract_characters"
+    )
+    hook = MongoHook(mongo_conn_id="mongo_default")
     client = hook.get_conn()
     db = client["characters_db"]
-    existing = []
-    for c in chars:
-        if db.characters.find_one({"char": c}):
-            existing.append(c)
-    # if any exist, go to conflict resolution; otherwise, go to bulk create
+
+    existing = [
+        ent for ent in chars if db.characters.find_one({"Entity": ent["Entity"]})
+    ]
+
     return "resolve_conflicts" if existing else "create_characters"
 
 
 def create_characters(**context):
     """Insert all new characters into MongoDB."""
-    chars = context["ti"].xcom_pull(key="chars", task_ids="extract_characters")
-    hook = MongoHook(conn_id="mongo_default")
+    chars = context["ti"].xcom_pull(
+        key="Entity", task_ids="extract_characters"
+    )
+    logger.info(f"Chars {chars} will be inserted into MongoDB.")
+    hook = MongoHook(mongo_conn_id="mongo_default")
     client = hook.get_conn()
     db = client["characters_db"]
-    for c, feats in chars.items():
-        db.characters.insert_one({"char": c, **feats})
+    db.characters.insert_many(chars)
 
 
 def resolve_conflicts(**context):
     """
-    For any character that already exists, compare old vs new features and
-    use a small LLM (≤2 B parameters) to reconcile differences.
+    For any character that already exists, reconcile old vs. new summaries
+    using a small text-generation model.
     """
-    chars = context["ti"].xcom_pull(key="chars", task_ids="extract_characters")
-    hook = MongoHook(conn_id="mongo_default")
+    chars = context["ti"].xcom_pull(
+        key="Entity", task_ids="extract_characters"
+    )
+    hook = MongoHook(mongo_conn_id="mongo_default")
     client = hook.get_conn()
     db = client["characters_db"]
 
-    # LLM setup: OPT-1.3B is ~1.3 B parameters
-    reconciler = pipeline("text2text-generation", model="facebook/opt-1.3b", device=0)
+    # Use a smaller model during local dev to avoid OOMs
+    reconciler = pipeline(
+        "text2text-generation",
+        model="facebook/opt-350m",
+        device=0,
+    )
 
-    for c, new_feats in chars.items():
-        record = db.characters.find_one({"char": c})
+    for ent in chars:
+        record = db.characters.find_one({"Entity": ent["Entity"]})
         if record:
             prompt = (
                 f"Old: {record}\n"
-                f"New: {new_feats}\n"
-                "Merge these without losing any true facts and resolve any conflicts."
+                f"New: {ent['summary']}\n"
+                "Merge these without losing any true facts and resolve conflicts."
             )
             result = reconciler(prompt, max_length=200)[0]["generated_text"]
-            # assume the LLM returns a JSON-like dict
-            merged = eval(result)  # convert text → dict (validate in prod!)
-            db.characters.replace_one({"char": c}, {"char": c, **merged})
+
+            # Expect JSON-like output; wrap in try/except for safety
+            try:
+                merged = json.loads(result)
+            except json.JSONDecodeError:
+                logger.warning("Model output is not valid JSON, skipping.")
+                continue
+
+            db.characters.replace_one(
+                {"Entity": ent["Entity"]},
+                {"Entity": ent["Entity"], **merged},
+            )
 
 
 with DAG(
     dag_id="character_ingestion_pipeline",
     default_args=default_args,
     start_date=datetime(2025, 6, 7),
-    schedule=None,  # trigger on file drop
+    schedule=None,  # manual trigger or file drop
     catchup=False,
 ) as dag:
+
     wait_for_file = FileSensor(
         task_id="wait_for_file",
         fs_conn_id="fs_default",
@@ -109,7 +162,8 @@ with DAG(
         task_id="extract_characters",
         python_callable=extract_characters,
         op_kwargs={
-            "file_path": "./include/data/input.txt",
+            "input_path": "./include/data/entities_input.txt",
+            "output_path": "./include/data/entities_output.json",
         },
     )
 

@@ -1,0 +1,16 @@
+version: '3.1'
+services:
+  # --- Extra service ---------------------------------------
+  mongo:
+    image: mongo:6
+    ports:            # optional; lets you connect with Compass
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - airflow       # same network as Airflow containers
+
+volumes:
+  mongo_data:
+networks:
+  airflow:

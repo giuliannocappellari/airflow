@@ -156,9 +156,10 @@ Use the `astro dev run` shortcut to execute Airflow CLI commands inside your run
 
 ```
 ├── Dockerfile
+├── .astro
 ├── airflow_settings.yaml    # custom Airflow config overrides
 ├── packages.txt             # uv-managed dependency list
-├── packages.lock            # uv lockfile (pins versions)
+├── uv.lock            # uv lockfile (pins versions)
 ├── include/                 # auto-mounted into containers at /include
 │   └── data/
 │       ├── input.txt
@@ -166,6 +167,12 @@ Use the `astro dev run` shortcut to execute Airflow CLI commands inside your run
 ├── dags/                    # your DAG definitions
 │   ├── txt_to_json.py
 │   └── entity_extraction_summarization.py
+│   └── test_connection.py
 ├── plugins/                 # custom operators/hooks
 ├── tests/                   # unit/integration tests
-└── README.md                # this file
+└── README.md                
+└── .env                # this file
+└── docker-compose.override.yaml                # this file
+└── pyproject.toml
+└── requirements.txt
+└── python-version
