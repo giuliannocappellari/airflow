@@ -9,6 +9,28 @@ dependencies = [
     "apache-airflow-providers-mongo>=5.1.0",
     "apache-airflow-providers-standard>=1.2.0",
     "loguru>=0.7.3",
+    "openai>=1.88.0",
     "torch>=2.7.1",
     "transformers>=4.52.4",
 ]
+
+[tool.mypy]
+python_version         = "3.13"
+ignore_missing_imports = true        # third-party libs without stubs
+disallow_untyped_defs  = true        # flag any function w/ no type hints
+strict_optional        = true        # None safety
+warn_return_any        = true
+warn_unused_ignores    = true
+show_error_codes       = true        # display PEP 657-style codes
+pretty                 = true        # nicer CLI output
+strict                 = false       # flip to true when you’re ready
+
+# Silence noisy libraries that rarely ship stubs
+[tool.mypy."apache_airflow.*"]
+ignore_missing_imports = true
+
+[tool.mypy."torch.*"]
+ignore_missing_imports = true
+
+[tool.mypy."transformers.*"]
+ignore_missing_imports = true
