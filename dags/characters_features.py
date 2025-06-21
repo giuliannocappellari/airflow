@@ -82,51 +82,75 @@ summarizer = None
 #         ti.xcom_push(key="Entity", value=results)  # type: ignore
 
 
-def extract_characters(input_path: str, output_path: str, **kwargs: dict) -> None:
+def extract_characters(input_path: str, output_path: str, **kwargs:dict) -> None:
     """
-    Read the dropped .txt file, extract each character and its raw features.
-    Pushes a list of dicts to XCom under the key "Entity".
+    Extract unique characters from the input text and summarise each one with
+    an OpenAI-compatible model.  The model is asked to produce a JSON list of
+    objects that match the schema:
+        [
+          {
+            "Entity":  "<character name>",
+            "summary": "<one-sentence summary>"
+          }
+        ]
+    The resulting list is:
+        • written to ``output_path`` for offline inspection
+        • pushed to XCom under the key ``Entity`` so downstream tasks can use it
     """
+    # ❶ Client initialisation (swap for env-var in prod)
     openai = OpenAI(
         api_key="LpigfeOnpSmg61F3FToNE8dWq7L5DDVA",
         base_url="https://api.deepinfra.com/v1/openai",
     )
+
+    # ❷ Read file
     logger.debug(
-        f"Listing files in {os.path.dirname(input_path)}: {os.listdir(os.path.dirname(input_path))}"
+        f"Listing files in {os.path.dirname(input_path)}:"
+        f" {os.listdir(os.path.dirname(input_path))}"
     )
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
 
-    prompt = (
-        "You are a story character extraction assistant. "
-        "Extract all unique characters from the text and summarize their features. "
-        "Return a JSON array of objects with 'Entity' and 'summary' fields."
-        "The JSON schema you must return is ```[{{Entity:<char_name>,summary:<char_summary>}}]```"
+    # ❸ System prompt + response-format definition
+    system_prompt = (
+        "You are a story-analysis assistant. "
+        "Return **only** a JSON array where each element has:\n"
+        "  • Entity  – the exact character name (string)\n"
+        "  • summary – a concise description (string, ≤ 25 words)\n"
+        "No additional keys, no prose outside the JSON."
+        "Example:\n"
+        '  [{\"Entity\": \"Alice\", \"summary\": \"A curious '
+        '   woman who explores a fantastical world.\"}, \n'
+        '   {\"Entity\": \"Bob\", \"summary\": \"A brave knight '
+        '   who fights dragons.\"}]'
     )
 
-    json_format = {
-        "type":"json_schema",
-        "stric":True,
-        "name":"entity",
-        "schema":{
-            
-        }
-    }
-
+    # ❹ Model call (new ``json_schema`` response format)
     chat_completion = openai.chat.completions.create(
         model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
         messages=[
-            {"role": "system", "content": prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
-        response_format={"type": "json_object"},
+        temperature=0
     )
+    logger.debug(f"Model response: {chat_completion}")
+    response_content = chat_completion.choices[0].message.content
+    logger.debug(f"Raw model response: {response_content}")
+    
+    try:
+        entities = json.loads(response_content)
+        assert isinstance(entities, list)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w") as out:
+            json.dump(entities, out)
 
-    logger.debug(f"Chat completion response: {chat_completion}")
-    logger.debug(
-        f"Chat completion response: {json.loads(chat_completion.choices[0].message.content)}"
-    )
-    return
+        ti = kwargs.get("ti")
+        if ti is not None:
+            ti.xcom_push(key="Entity", value=entities)  # type: ignore
+    except Exception as e:
+        logger.error("Model did not return valid JSON. Aborting run.")
+
 
 
 def decide_existence(**context: dict) -> str:
