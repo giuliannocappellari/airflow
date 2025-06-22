@@ -4,12 +4,14 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.models.baseoperator import chain
+from airflow.models.param import ParamsDict
 from airflow.providers.mongo.hooks.mongo import MongoHook
 from airflow.providers.standard.operators.python import (
     BranchPythonOperator,
     PythonOperator,
 )
 from airflow.providers.standard.sensors.filesystem import FileSensor
+from airflow.sdk import Param
 from airflow.utils.trigger_rule import TriggerRule
 from loguru import logger
 from openai import OpenAI
@@ -26,63 +28,9 @@ ner = None
 summarizer = None
 
 
-# def extract_characters(input_path: str, output_path: str, **kwargs: dict) -> None:
-#     """
-#     Read the dropped .txt file, extract each unique character and its raw features.
-#     Pushes a list of dicts to XCom under the key "Entity".
-#     """
-#     global ner, summarizer
-#     logger.debug(f"Listing files in {os.path.dirname(input_path)}: {os.listdir(os.path.dirname(input_path))}")
-#     with open(input_path, "r", encoding="utf-8") as f:
-#         text = f.read()
-
-#     # Lazy-load the NER and summarizer only once per worker
-#     if ner is None or summarizer is None:
-#         ner = pipeline(
-#             "ner",
-#             grouped_entities=True,
-#             model="dslim/bert-base-NER",
-#         )
-#         summarizer = pipeline(
-#             "summarization",
-#             model="sshleifer/distilbart-cnn-12-6",
-#         )
-
-#     raw_entities = ner(text)
-#     if not raw_entities:
-#         logger.warning("No entities found in the input text.")
-#         return
-#     entities = {e["word"] for e in raw_entities if isinstance(e, dict) and "word" in e}
-#     logger.debug(entities)
-#     return
-#     results = []
-#     for ent in entities:
-#         sentences = [s for s in text.split(".") if ent in s]
-#         context = ". ".join(sentences) or text
-#         summary_result = summarizer(
-#             context,
-#             max_length=50,
-#             min_length=5,
-#             do_sample=False,
-#         )
-#         summary_list = list(summary_result) if summary_result is not None else []
-#         summary = (
-#             summary_list[0].get("summary_text", "")
-#             if summary_list and isinstance(summary_list[0], dict)
-#             else ""
-#         )
-#         results.append({"Entity": ent, "summary": summary})
-
-#     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-#     with open(output_path, "w") as out:
-#         json.dump(results, out)
-
-#     ti = kwargs.get("ti")
-#     if ti is not None:
-#         ti.xcom_push(key="Entity", value=results)  # type: ignore
-
-
-def extract_characters(input_path: str, output_path: str, **kwargs:dict) -> None:
+def extract_characters(
+    input_path: str, output_path: str, model: str, **kwargs: dict
+) -> None:
     """
     Extract unique characters from the input text and summarise each one with
     an OpenAI-compatible model.  The model is asked to produce a JSON list of
@@ -94,24 +42,19 @@ def extract_characters(input_path: str, output_path: str, **kwargs:dict) -> None
           }
         ]
     The resulting list is:
-        • written to ``output_path`` for offline inspection
-        • pushed to XCom under the key ``Entity`` so downstream tasks can use it
+        written to ``output_path`` for offline inspection
+        pushed to XCom under the key ``Entity`` so downstream tasks can use it
     """
-    # ❶ Client initialisation (swap for env-var in prod)
-    openai = OpenAI(
-        api_key="LpigfeOnpSmg61F3FToNE8dWq7L5DDVA",
-        base_url="https://api.deepinfra.com/v1/openai",
-    )
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set in the container environment.")
+    openai = OpenAI(api_key=api_key, base_url="https://api.deepinfra.com/v1/openai")
 
-    # ❷ Read file
-    logger.debug(
-        f"Listing files in {os.path.dirname(input_path)}:"
-        f" {os.listdir(os.path.dirname(input_path))}"
-    )
+    logger.debug(f"Model: {model}")
+    logger.debug(f"kwargs: {kwargs}")
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
 
-    # ❸ System prompt + response-format definition
     system_prompt = (
         "You are a story-analysis assistant. "
         "Return **only** a JSON array where each element has:\n"
@@ -119,25 +62,24 @@ def extract_characters(input_path: str, output_path: str, **kwargs:dict) -> None
         "  • summary – a concise description (string, ≤ 25 words)\n"
         "No additional keys, no prose outside the JSON."
         "Example:\n"
-        '  [{\"Entity\": \"Alice\", \"summary\": \"A curious '
-        '   woman who explores a fantastical world.\"}, \n'
-        '   {\"Entity\": \"Bob\", \"summary\": \"A brave knight '
-        '   who fights dragons.\"}]'
+        '  [{"Entity": "Alice", "summary": "A curious '
+        '   woman who explores a fantastical world."}, \n'
+        '   {"Entity": "Bob", "summary": "A brave knight '
+        '   who fights dragons."}]'
     )
 
-    # ❹ Model call (new ``json_schema`` response format)
     chat_completion = openai.chat.completions.create(
         model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
-        temperature=0
+        temperature=0,
     )
-    logger.debug(f"Model response: {chat_completion}")
     response_content = chat_completion.choices[0].message.content
-    logger.debug(f"Raw model response: {response_content}")
-    
+    if not response_content:
+        logger.error("Model did not return any content. Aborting run.")
+        return
     try:
         entities = json.loads(response_content)
         assert isinstance(entities, list)
@@ -152,7 +94,6 @@ def extract_characters(input_path: str, output_path: str, **kwargs:dict) -> None
         logger.error("Model did not return valid JSON. Aborting run.")
 
 
-
 def decide_existence(**context: dict) -> str:
     """
     Check MongoDB for each character.
@@ -161,6 +102,7 @@ def decide_existence(**context: dict) -> str:
     chars = context["ti"].xcom_pull(key="Entity", task_ids="extract_characters")  # type: ignore
     hook = MongoHook(mongo_conn_id="mongo_default")
     client = hook.get_conn()
+
     db = client["characters_db"]
 
     existing = [
@@ -170,10 +112,31 @@ def decide_existence(**context: dict) -> str:
     return "resolve_conflicts" if existing else "create_characters"
 
 
-def create_characters(**context: dict) -> None:
-    """Insert all new characters into MongoDB."""
+def create_characters(model: str, **context: dict) -> None:
+    """
+    Insert all new characters into MongoDB, tagging each one with
+    the model that generated it.
+
+    Parameters
+    ----------
+    model : str
+        Name (or version) of the model used to create the characters.
+    **context : dict
+        Airflow context dict (expects XCom key `"Entity"`).
+    """
+
     chars = context["ti"].xcom_pull(key="Entity", task_ids="extract_characters")  # type: ignore
-    logger.info(f"Chars {chars} will be inserted into MongoDB.")
+
+    if not chars:
+        logger.warning("No characters returned from XCom; nothing to insert.")
+        return
+
+    for char in chars:
+        if isinstance(char, dict):
+            char.setdefault("metadata", {})["model"] = model
+
+    logger.info("Inserting %d characters into MongoDB: %s", len(chars), chars)
+
     hook = MongoHook(mongo_conn_id="mongo_default")
     client = hook.get_conn()
     db = client["characters_db"]
@@ -197,6 +160,7 @@ def resolve_conflicts(**context: dict) -> None:
         device=0,
     )
 
+    logger.info("Model loaded")
     for ent in chars:
         record = db.characters.find_one({"Entity": ent["Entity"]})
         if record:
@@ -226,7 +190,21 @@ with DAG(
     default_args=default_args,
     start_date=datetime(2025, 6, 7),
     schedule=None,  # manual trigger or file drop
-    catchup=False,
+    params=ParamsDict(
+        {
+            "llm": Param(
+                "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                type="string",
+                enum=[
+                    "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                    "deepseek-ai/DeepSeek-R1-0528",
+                    "deepseek-ai/DeepSeek-V3-0324",
+                    "google/gemma-3-27b-it",
+                ],
+            )
+        }
+    ),
+    render_template_as_native_obj=True,
 ) as dag:
     wait_for_file = FileSensor(
         task_id="wait_for_file",
@@ -242,6 +220,7 @@ with DAG(
         op_kwargs={
             "input_path": "./include/data/entities_input.txt",
             "output_path": "./include/data/entities_output.json",
+            "model": "{{ params.llm }}",
         },
     )
 
@@ -253,6 +232,9 @@ with DAG(
     create_characters_op = PythonOperator(
         task_id="create_characters",
         python_callable=create_characters,
+        op_kwargs={
+            "model": "{{ params.llm }}",
+        },
     )
 
     resolve_conflicts_op = PythonOperator(
@@ -272,4 +254,5 @@ if __name__ == "__main__":
     extract_characters(
         input_path="./include/data/entities_input.txt",
         output_path="./include/data/entities_output.json",
+        model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
     )
