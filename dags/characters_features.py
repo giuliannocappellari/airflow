@@ -15,7 +15,6 @@ from airflow.sdk import Param
 from airflow.utils.trigger_rule import TriggerRule
 from loguru import logger
 from openai import OpenAI
-from transformers.pipelines import pipeline
 
 default_args = {
     "owner": "you",
@@ -69,7 +68,7 @@ def extract_characters(
     )
 
     chat_completion = openai.chat.completions.create(
-        model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
@@ -154,25 +153,42 @@ def resolve_conflicts(**context: dict) -> None:
     db = client["characters_db"]
 
     # Use a smaller model during local dev to avoid OOMs
-    reconciler = pipeline(
-        "text2text-generation",
-        model="facebook/opt-350m",
-        device=0,
-    )
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set in the container environment.")
+    openai = OpenAI(api_key=api_key, base_url="https://api.deepinfra.com/v1/openai")
 
     logger.info("Model loaded")
     for ent in chars:
         record = db.characters.find_one({"Entity": ent["Entity"]})
         if record:
+            system_prompt = (
+                "You are a story-analysis assistant. "
+                "Return **only** a JSON array where each element has:\n"
+                "  • Entity  – the exact character name (string)\n"
+                "  • summary – a concise description (string, ≤ 25 words)\n"
+                "No additional keys, no prose outside the JSON."
+                "Example:\n"
+                '  [{"Entity": "Alice", "summary": "A curious '
+                '   woman who explores a fantastical world."}, \n'
+                '   {"Entity": "Bob", "summary": "A brave knight '
+                '   who fights dragons."}]'
+            )
             prompt = (
                 f"Old: {record}\n"
                 f"New: {ent['summary']}\n"
                 "Merge these without losing any true facts and resolve conflicts."
             )
-            result = reconciler(prompt, max_length=200)
+            chat_completion = openai.chat.completions.create(
+                model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+            )
+            result = chat_completion.choices[0].message.content
             if result and isinstance(result, list):
-                result = result[0]["generated_text"]
-
                 try:
                     merged = json.loads(result)
                 except json.JSONDecodeError:

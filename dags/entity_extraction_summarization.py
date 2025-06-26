@@ -4,16 +4,16 @@ import os
 from airflow import DAG
 from airflow.providers.standard.operators.python import PythonOperator
 from utils import days_ago
+from transformers.pipelines import pipeline
 
 ner = None
 summarizer = None
 
 
-def extract_and_summarize(input_path: str, output_path: str, **kwargs):
+def extract_and_summarize(input_path: str, output_path: str, **kwargs:dict) -> None:
     global ner, summarizer
 
     if ner is None or summarizer is None:
-        from transformers import pipeline
 
         ner = pipeline(
             "ner",
@@ -28,14 +28,15 @@ def extract_and_summarize(input_path: str, output_path: str, **kwargs):
     with open(input_path, "r") as f:
         text = f.read()
     raw_entities = ner(text)
-    entities = {e["word"] for e in raw_entities}
+    if not raw_entities:
+        raise ValueError("No entities found in the input text.")
+    entities = {e["word"] for e in raw_entities if isinstance(e, dict) and "word" in e}
     results = {}
     for ent in entities:
         sentences = [s for s in text.split(".") if ent in s]
         context = ". ".join(sentences) or text
-        summary = summarizer(context, max_length=50, min_length=5, do_sample=False)[0][
-            "summary_text"
-        ]
+        summary_result = summarizer(context, max_length=50, min_length=5, do_sample=False)
+        summary = summary_result[0]["summary_text"]  # type: ignore
         results[ent] = summary
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -55,6 +56,6 @@ with DAG(
         python_callable=extract_and_summarize,
         op_kwargs={
             "input_path": "./include/data/entities_input.txt",
-            "output_path": "./include/data/entities_output.json",
+            "output_path": "./include/data/summary_output.json",
         },
     )
